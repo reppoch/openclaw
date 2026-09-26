@@ -1,0 +1,82 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git
+          git fetch upstream --tags
+
+      - name: Save our workflow files
+        run: |
+          mkdir -p /tmp/our-workflows /tmp/our-ci-patches
+          cp .github/workflows/build-image.yml /tmp/our-workflows/ 2>/dev/null || true
+          cp .github/workflows/sync-upstream.yml /tmp/our-workflows/ 2>/dev/null || true
+          cp .github/workflows/cleanup-images.yml /tmp/our-workflows/ 2>/dev/null || true
+          if [[ -f ci-patches/apply-dockerfile-ci-build.sh ]]; then
+            cp ci-patches/apply-dockerfile-ci-build.sh /tmp/our-ci-patches/
+          elif [[ -f patches/apply-dockerfile-ci-build.sh ]]; then
+            cp patches/apply-dockerfile-ci-build.sh /tmp/our-ci-patches/
+          fi
+          ls -la /tmp/our-workflows/
+
+      - name: Verify saved files
+        run: |
+          echo "Saved workflow files:"
+          ls -la /tmp/our-workflows/
+          if [ ! -f /tmp/our-workflows/sync-upstream.yml ]; then
+            echo "ERROR: sync-upstream.yml was not saved!"
+            exit 1
+          fi
+          if [ ! -f /tmp/our-workflows/build-image.yml ]; then
+            echo "ERROR: build-image.yml was not saved!"
+            exit 1
+          fi
+
+      - name: Sync main branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout main
+          git reset --hard upstream/main
+          # Remove upstream workflows, restore only ours
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp /tmp/our-workflows/* .github/workflows/
+          if [[ -f /tmp/our-ci-patches/apply-dockerfile-ci-build.sh ]]; then
+            mkdir -p ci-patches
+            cp /tmp/our-ci-patches/apply-dockerfile-ci-build.sh ci-patches/
+            chmod +x ci-patches/apply-dockerfile-ci-build.sh
+          fi
+          echo "Restored workflow files:"
+          ls -la .github/workflows/build-image.yml .github/workflows/sync-upstream.yml .github/workflows/cleanup-images.yml
+          ls -la ci-patches/apply-dockerfile-ci-build.sh 2>/dev/null || echo "WARNING: ci-patches/ not restored"
+          git add .github/workflows/
+          git add ci-patches/ 2>/dev/null || true
+          git commit -m "Add build workflows and CI Dockerfile patch"
+          git push origin main --force
+
+      - name: Summary
+        run: |
+          LATEST_TAG=$(git tag --sort=-version:refname | head -1)
+          echo "### Upstream Sync Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Latest tag:** ${LATEST_TAG}" >> $GITHUB_STEP_SUMMARY
+          echo "**Main branch:** $(git rev-parse --short HEAD)" >> $GITHUB_STEP_SUMMARY
