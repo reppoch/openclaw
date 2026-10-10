@@ -1,0 +1,173 @@
+# Clean up old Docker images from GitHub Container Registry.
+#
+# Keeps:
+#   - The latest release (:latest and its version tag)
+#   - The latest nightly (:nightly and its sha tag)
+#   - The main tag
+#
+# Deletes everything else.
+#
+name: Cleanup Old Images
+
+on:
+  schedule:
+    # Run weekly on Sunday at 5am UTC
+    - cron: '0 5 * * 0'
+
+  # Allow manual trigger
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+
+    steps:
+      - name: Delete old image versions
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.SYNC_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const packageName = 'openclaw';
+
+            // Tags to always keep
+            const keepTags = new Set(['latest', 'nightly', 'main']);
+
+            console.log('Fetching package versions...');
+
+            // Get all versions
+            const versions = [];
+            let page = 1;
+            while (true) {
+              const resp = await github.rest.packages.getAllPackageVersionsForPackageOwnedByUser({
+                package_type: 'container',
+                package_name: packageName,
+                username: owner,
+                per_page: 100,
+                page: page,
+              });
+              versions.push(...resp.data);
+              if (resp.data.length < 100) break;
+              page++;
+            }
+
+            console.log(`Found ${versions.length} total versions`);
+
+            // Find the version IDs for tags we want to keep
+            const keepIds = new Set();
+            const latestNightlySha = { tag: null, updated: null, id: null };
+            const latestRelease = { tag: null, updated: null, id: null };
+
+            for (const v of versions) {
+              const tags = v.metadata?.container?.tags || [];
+
+              for (const tag of tags) {
+                // Always keep these
+                if (keepTags.has(tag)) {
+                  keepIds.add(v.id);
+                }
+
+                // Track latest nightly-sha
+                if (tag.startsWith('nightly-')) {
+                  if (!latestNightlySha.updated || v.updated_at > latestNightlySha.updated) {
+                    latestNightlySha.tag = tag;
+                    latestNightlySha.updated = v.updated_at;
+                    latestNightlySha.id = v.id;
+                  }
+                }
+
+                // Track latest release version tag
+                if (tag.startsWith('v')) {
+                  if (!latestRelease.updated || v.updated_at > latestRelease.updated) {
+                    latestRelease.tag = tag;
+                    latestRelease.updated = v.updated_at;
+                    latestRelease.id = v.id;
+                  }
+                }
+              }
+            }
+
+            // Keep the latest nightly-sha and latest release
+            if (latestNightlySha.id) {
+              keepIds.add(latestNightlySha.id);
+              console.log(`Keeping latest nightly: ${latestNightlySha.tag}`);
+            }
+            if (latestRelease.id) {
+              keepIds.add(latestRelease.id);
+              console.log(`Keeping latest release: ${latestRelease.tag}`);
+            }
+
+            // Protect untagged manifests referenced by kept indexes
+            // (platform manifests + attestation manifests)
+            const keepDigests = new Set();
+            for (const v of versions) {
+              if (!keepIds.has(v.id)) continue;
+              try {
+                const manifest = await github.request(
+                  'GET /user/packages/{package_type}/{package_name}/versions/{package_version_id}',
+                  { package_type: 'container', package_name: packageName, package_version_id: v.id }
+                );
+                // GHCR html_url contains the digest; but we need child digests
+                // Fetch the actual manifest from the registry to find referenced digests
+                const name = `${owner}/${packageName}`.toLowerCase();
+                const tokenResp = await fetch(
+                  `https://ghcr.io/token?scope=repository:${name}:pull`
+                );
+                const { token } = await tokenResp.json();
+                const tags = manifest.data.metadata?.container?.tags || [];
+                if (tags.length === 0) continue;
+                const indexResp = await fetch(
+                  `https://ghcr.io/v2/${name}/manifests/${tags[0]}`,
+                  { headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Accept': 'application/vnd.oci.image.index.v1+json',
+                  }}
+                );
+                if (!indexResp.ok) continue;
+                const idx = await indexResp.json();
+                for (const m of (idx.manifests || [])) {
+                  if (m.digest) keepDigests.add(m.digest);
+                }
+              } catch (err) {
+                console.log(`  Warning: could not resolve children for version ${v.id}: ${err.message}`);
+              }
+            }
+
+            // Add child versions to keepIds by matching digest
+            for (const v of versions) {
+              if (keepIds.has(v.id)) continue;
+              const vName = v.name; // version name is the digest in GHCR
+              if (keepDigests.has(vName)) {
+                keepIds.add(v.id);
+              }
+            }
+
+            // Delete everything else
+            let deleted = 0;
+            for (const v of versions) {
+              if (keepIds.has(v.id)) {
+                const tags = v.metadata?.container?.tags || ['untagged'];
+                console.log(`Keeping: ${tags.join(', ')} (${v.name.substring(0, 19)})`);
+                continue;
+              }
+
+              const tags = v.metadata?.container?.tags || ['untagged'];
+              console.log(`Deleting: ${tags.join(', ')} (${v.updated_at})`);
+
+              try {
+                await github.rest.packages.deletePackageVersionForUser({
+                  package_type: 'container',
+                  package_name: packageName,
+                  username: owner,
+                  package_version_id: v.id,
+                });
+                deleted++;
+              } catch (err) {
+                console.log(`  Failed to delete: ${err.message}`);
+              }
+            }
+
+            console.log(`\nDone. Deleted ${deleted} versions, kept ${keepIds.size}.`);
