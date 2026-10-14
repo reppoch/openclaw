@@ -1,0 +1,248 @@
+# Build and push OpenClaw arm64 Docker image to GitHub Container Registry.
+#
+# Produces two image channels:
+#   - Release: upstream GitHub releases/latest (stable only; no alpha/beta), builds if missing from registry
+#   - Nightly: always builds from current main
+#
+# Images will be at: ghcr.io/<your-github-username>/openclaw
+#
+# Native arm64 runners (no QEMU). Before build, ci-patches/apply-dockerfile-ci-build.sh
+# sets OPENCLAW_DISABLE_P2P and related env for pnpm build:docker (CLI metadata).
+#
+name: Build Docker Image
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+    inputs:
+      tag_override:
+        description: 'Optional image tag override (e.g. "test-build")'
+        required: false
+      force_release:
+        description: 'Force a release build from latest upstream stable release'
+        required: false
+        default: 'false'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/openclaw
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check for new upstream release
+        id: release
+        run: |
+          LATEST_TAG=$(curl -sfL "https://api.github.com/repos/openclaw/openclaw/releases/latest" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); t=d.get('tag_name'); print(t if isinstance(t,str) else '', end='')")
+
+          if [[ -z "$LATEST_TAG" ]]; then
+            echo "ERROR: could not resolve upstream releases/latest tag" >&2
+            exit 1
+          fi
+
+          # releases/latest excludes GitHub prereleases; reject alpha/beta suffixes as a safeguard
+          if [[ "$LATEST_TAG" =~ -(alpha|beta) ]]; then
+            echo "ERROR: refusing to build prerelease tag: ${LATEST_TAG}" >&2
+            exit 1
+          fi
+
+          echo "latest_tag=${LATEST_TAG}" >> "$GITHUB_OUTPUT"
+
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" | tr '[:upper:]' '[:lower:]')
+          TAG_EXISTS=false
+          TOKEN=$(curl -sf "https://ghcr.io/token?scope=repository:$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]'):pull" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+          if [ -n "$TOKEN" ] && curl -sf -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json" "https://ghcr.io/v2/$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')/manifests/${LATEST_TAG}" > /dev/null 2>&1; then
+            TAG_EXISTS=true
+          fi
+
+          SHOULD_BUILD=false
+          if [[ "$TAG_EXISTS" == "false" && -n "$LATEST_TAG" ]]; then
+            SHOULD_BUILD=true
+          fi
+          if [[ "${{ github.event.inputs.force_release }}" == "true" ]]; then
+            SHOULD_BUILD=true
+          fi
+
+          echo "tag_exists=${TAG_EXISTS}" >> "$GITHUB_OUTPUT"
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "Latest stable release: ${LATEST_TAG}, exists: ${TAG_EXISTS}, will build: ${SHOULD_BUILD}"
+
+      - name: Checkout repository
+        if: steps.release.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout release tag
+        if: steps.release.outputs.should_build == 'true'
+        run: |
+          if [[ -f ci-patches/apply-dockerfile-ci-build.sh ]]; then
+            cp ci-patches/apply-dockerfile-ci-build.sh /tmp/apply-dockerfile-ci-build.sh
+          fi
+          git remote add upstream https://github.com/openclaw/openclaw.git 2>/dev/null || true
+          git fetch upstream --tags
+          git checkout "${{ steps.release.outputs.latest_tag }}"
+          if [[ -f /tmp/apply-dockerfile-ci-build.sh ]]; then
+            mkdir -p ci-patches
+            cp /tmp/apply-dockerfile-ci-build.sh ci-patches/
+            chmod +x ci-patches/apply-dockerfile-ci-build.sh
+          fi
+
+      - name: Patch Dockerfile for CI build:docker
+        if: steps.release.outputs.should_build == 'true'
+        run: bash ./ci-patches/apply-dockerfile-ci-build.sh
+
+      - name: Set up Docker Buildx
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate build metadata
+        if: steps.release.outputs.should_build == 'true'
+        id: meta
+        run: |
+          echo "build_date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push release
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.release.outputs.latest_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,scope=release,mode=max
+          build-args: |
+            OPENCLAW_DOCKER_APT_PACKAGES=
+          annotations: |
+            manifest-descriptor:org.opencontainers.image.created=${{ steps.meta.outputs.build_timestamp }}
+            manifest-descriptor:org.openclaw.build.date=${{ steps.meta.outputs.build_date }}
+
+      - name: Summary
+        if: steps.release.outputs.should_build == 'true'
+        run: |
+          echo "### Release Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ steps.release.outputs.latest_tag }}, latest" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform:** linux/arm64" >> $GITHUB_STEP_SUMMARY
+
+      - name: Skip summary
+        if: steps.release.outputs.should_build != 'true'
+        run: |
+          echo "### Release: Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "Stable release ${{ steps.release.outputs.latest_tag }} already built." >> $GITHUB_STEP_SUMMARY
+
+  nightly:
+    runs-on: ubuntu-24.04-arm
+    if: github.event.inputs.tag_override == '' && github.event.inputs.force_release != 'true'
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Patch Dockerfile for CI build:docker
+        run: bash ./ci-patches/apply-dockerfile-ci-build.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate build metadata
+        id: meta
+        run: |
+          echo "build_date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "build_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push nightly
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly-${{ github.sha }}
+          cache-from: type=gha,scope=nightly
+          cache-to: type=gha,scope=nightly,mode=max
+          build-args: |
+            OPENCLAW_DOCKER_APT_PACKAGES=
+          annotations: |
+            manifest-descriptor:org.opencontainers.image.created=${{ steps.meta.outputs.build_timestamp }}
+            manifest-descriptor:org.openclaw.build.date=${{ steps.meta.outputs.build_date }}
+
+      - name: Summary
+        run: |
+          echo "### Nightly Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** nightly, nightly-${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform:** linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
+
+  custom:
+    runs-on: ubuntu-24.04-arm
+    if: github.event.inputs.tag_override != ''
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Patch Dockerfile for CI build:docker
+        run: bash ./ci-patches/apply-dockerfile-ci-build.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push custom tag
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.tag_override }}
+          build-args: |
+            OPENCLAW_DOCKER_APT_PACKAGES=
+
+      - name: Summary
+        run: |
+          echo "### Custom Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${{ github.event.inputs.tag_override }}" >> $GITHUB_STEP_SUMMARY
